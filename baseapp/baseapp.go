@@ -1110,9 +1110,16 @@ func (app *BaseApp) runTx(mode execMode, txBytes []byte) (gInfo sdk.GasInfo, res
 	// Attempt to execute all messages and only update state if all messages pass
 	// and we're in DeliverTx. Note, runMsgs will never return a reference to a
 	// Result if any single message fails or does not have a registered Handler.
-	msgsV2, err := tx.GetMsgsV2()
-	if err == nil {
+	// NOTE: We attempt to get V2 messages, but if that fails (e.g., for app-injected
+	// messages without signers), we still execute the messages using the V1 path.
+	// This is critical for app-injected messages like MsgUpdateMarketPrices.
+	msgsV2, errGetMsgsV2 := tx.GetMsgsV2()
+	if errGetMsgsV2 == nil {
 		result, err = app.runMsgs(runMsgCtx, msgs, msgsV2, mode)
+	} else {
+		// Fallback for messages without signers (e.g., app-injected messages)
+		// We still need to execute the messages even if GetMsgsV2 fails
+		result, err = app.runMsgsWithoutV2(runMsgCtx, msgs, mode)
 	}
 
 	// Run optional postHandlers (should run regardless of the execution result).
@@ -1226,6 +1233,79 @@ func (app *BaseApp) runMsgs(ctx sdk.Context, msgs []sdk.Msg, msgsV2 []protov2.Me
 // makeABCIData generates the Data field to be sent to ABCI Check/DeliverTx.
 func makeABCIData(msgResponses []*codectypes.Any) ([]byte, error) {
 	return proto.Marshal(&sdk.TxMsgData{MsgResponses: msgResponses})
+}
+
+// runMsgsWithoutV2 iterates through a list of messages and executes them with the provided
+// Context and execution mode. This is a fallback for messages without signers (e.g., app-injected
+// messages) where GetMsgsV2() fails. Events are created without requiring V2 message signers.
+func (app *BaseApp) runMsgsWithoutV2(ctx sdk.Context, msgs []sdk.Msg, mode execMode) (*sdk.Result, error) {
+	events := sdk.EmptyEvents()
+	var msgResponses []*codectypes.Any
+
+	// NOTE: GasWanted is determined by the AnteHandler and GasUsed by the GasMeter.
+	for i, msg := range msgs {
+		if mode != execModeFinalize && mode != execModeSimulate {
+			break
+		}
+
+		handler := app.msgServiceRouter.Handler(msg)
+		if handler == nil {
+			return nil, errorsmod.Wrapf(sdkerrors.ErrUnknownRequest, "no message handler found for %T", msg)
+		}
+
+		// ADR 031 request type routing
+		msgResult, err := handler(ctx, msg)
+		if err != nil {
+			return nil, errorsmod.Wrapf(err, "failed to execute message; message index: %d", i)
+		}
+
+		// create message events without V2 signer information
+		msgEvents, err := createEventsWithoutV2(msgResult.GetEvents(), msg)
+		if err != nil {
+			return nil, errorsmod.Wrapf(err, "failed to create message events; message index: %d", i)
+		}
+
+		// append message events and data
+		//
+		// Note: Each message result's data must be length-prefixed in order to
+		// separate each result.
+		events = events.AppendEvents(msgEvents)
+
+		msgResponse, err := codectypes.NewAnyWithValue(msgResult)
+		if err != nil {
+			return nil, errorsmod.Wrapf(err, "failed to pack message response; message index: %d", i)
+		}
+		msgResponses = append(msgResponses, msgResponse)
+	}
+
+	data, err := makeABCIData(msgResponses)
+	if err != nil {
+		return nil, errorsmod.Wrap(err, "failed to marshal tx data")
+	}
+
+	return &sdk.Result{
+		Data:         data,
+		Events:       events.ToABCIEvents(),
+		MsgResponses: msgResponses,
+	}, nil
+}
+
+// createEventsWithoutV2 creates message events without requiring V2 message signers.
+// This is used for app-injected messages that don't have signers.
+func createEventsWithoutV2(eventResults sdk.Events, msg sdk.Msg) (sdk.Events, error) {
+	eventMsgName := sdk.MsgTypeURL(msg)
+	msgEvent := sdk.NewEvent(sdk.EventTypeMessage, sdk.NewAttribute(sdk.AttributeKeyAction, eventMsgName))
+
+	// For app-injected messages without signers, we don't set the sender attribute
+
+	// verify that events have no module attribute set
+	if _, found := eventResults.GetAttributes(sdk.AttributeKeyModule); !found {
+		if moduleName := sdk.GetModuleNameFromTypeURL(eventMsgName); moduleName != "" {
+			msgEvent = msgEvent.AppendAttributes(sdk.NewAttribute(sdk.AttributeKeyModule, moduleName))
+		}
+	}
+
+	return sdk.Events{msgEvent}.AppendEvents(eventResults), nil
 }
 
 func createEvents(cdc codec.Codec, events sdk.Events, msg sdk.Msg, msgV2 protov2.Message) (sdk.Events, error) {
