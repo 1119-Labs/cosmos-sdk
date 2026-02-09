@@ -5,6 +5,7 @@ import (
 	"io"
 	"math"
 
+	abci "github.com/cometbft/cometbft/abci/types"
 	dbm "github.com/cosmos/cosmos-db"
 
 	"cosmossdk.io/store/metrics"
@@ -210,6 +211,20 @@ func (app *BaseApp) SetEndBlocker(endBlocker sdk.EndBlocker) {
 	}
 
 	app.endBlocker = endBlocker
+}
+
+// SetParallelTxExecutor sets a custom parallel tx execution function for FinalizeBlock.
+// When set, this replaces the default sequential tx execution loop in
+// internalFinalizeBlock. If it returns an error, the system falls back to sequential.
+// This is used by Block-STM parallel execution.
+func (app *BaseApp) SetParallelTxExecutor(
+	fn func(ctx sdk.Context, txs [][]byte) ([]*abci.ExecTxResult, error),
+) {
+	if app.sealed {
+		panic("SetParallelTxExecutor() on sealed BaseApp")
+	}
+
+	app.parallelTxExecutor = fn
 }
 
 func (app *BaseApp) SetPrepareCheckStater(prepareCheckStater sdk.PrepareCheckStater) {
