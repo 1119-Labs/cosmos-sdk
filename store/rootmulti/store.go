@@ -509,34 +509,54 @@ func (rs *Store) Commit() types.CommitID {
 }
 
 // WorkingHash returns the current hash of the store.
-// it will be used to get the current app hash before commit.
+// It will be used to get the current app hash before commit.
+// Phase 3 optimization: computes each store's WorkingHash in parallel to reduce
+// latency when many IAVL stores are mounted.
 func (rs *Store) WorkingHash() []byte {
-	storeInfos := make([]types.StoreInfo, 0, len(rs.stores))
 	storeKeys := keysFromStoreKeyMap(rs.stores)
 
+	type hashJob struct {
+		key  types.StoreKey
+		hash []byte
+	}
+	var jobs []hashJob
 	for _, key := range storeKeys {
 		store := rs.stores[key]
-
 		if store.GetStoreType() != types.StoreTypeIAVL {
 			continue
 		}
-
-		if !rs.removalMap[key] {
-			si := types.StoreInfo{
-				Name: key.Name(),
-				CommitId: types.CommitID{
-					Hash: store.WorkingHash(),
-				},
-			}
-			storeInfos = append(storeInfos, si)
+		if rs.removalMap[key] {
+			continue
 		}
+		jobs = append(jobs, hashJob{key: key})
 	}
 
-	sort.SliceStable(storeInfos, func(i, j int) bool {
-		return storeInfos[i].Name < storeInfos[j].Name
+	if len(jobs) == 0 {
+		return types.CommitInfo{StoreInfos: []types.StoreInfo{}}.Hash()
+	}
+
+	// Compute WorkingHash for each store in parallel.
+	results := make([]types.StoreInfo, len(jobs))
+	var wg sync.WaitGroup
+	for i, job := range jobs {
+		wg.Add(1)
+		go func(idx int, k types.StoreKey) {
+			defer wg.Done()
+			store := rs.stores[k]
+			hash := store.WorkingHash()
+			results[idx] = types.StoreInfo{
+				Name: k.Name(),
+				CommitId: types.CommitID{Hash: hash},
+			}
+		}(i, job.key)
+	}
+	wg.Wait()
+
+	sort.SliceStable(results, func(i, j int) bool {
+		return results[i].Name < results[j].Name
 	})
 
-	return types.CommitInfo{StoreInfos: storeInfos}.Hash()
+	return types.CommitInfo{StoreInfos: results}.Hash()
 }
 
 // CacheWrap implements CacheWrapper/Store/CommitStore.
@@ -1193,38 +1213,69 @@ func GetLatestVersion(db dbm.DB) int64 {
 }
 
 // Commits each store and returns a new commitInfo.
+// Phase 3 optimization: commits IAVL stores in parallel since each store's
+// Commit() is independent. This reduces total commit latency when many stores
+// are mounted.
 func commitStores(version int64, storeMap map[types.StoreKey]types.CommitKVStore, removalMap map[types.StoreKey]bool) *types.CommitInfo {
-	storeInfos := make([]types.StoreInfo, 0, len(storeMap))
 	storeKeys := keysFromStoreKeyMap(storeMap)
 
+	// Collect stores that need committing (non-transient, non-memory).
+	// Removed stores are still committed but not added to storeInfos.
+	type storeCommitJob struct {
+		key       types.StoreKey
+		store     types.CommitKVStore
+		isRemoval bool
+	}
+	var jobs []storeCommitJob
 	for _, key := range storeKeys {
 		store := storeMap[key]
-		last := store.LastCommitID()
-
-		// If a commit event execution is interrupted, a new iavl store's version
-		// will be larger than the RMS's metadata, when the block is replayed, we
-		// should avoid committing that iavl store again.
-		var commitID types.CommitID
-		if last.Version >= version {
-			last.Version = version
-			commitID = last
-		} else {
-			commitID = store.Commit()
-		}
-
-		storeType := store.GetStoreType()
-		if storeType == types.StoreTypeTransient || storeType == types.StoreTypeMemory {
+		if store.GetStoreType() == types.StoreTypeTransient || store.GetStoreType() == types.StoreTypeMemory {
 			continue
 		}
-
-		if !removalMap[key] {
-			si := types.StoreInfo{}
-			si.Name = key.Name()
-			si.CommitId = commitID
-			storeInfos = append(storeInfos, si)
-		}
+		jobs = append(jobs, storeCommitJob{
+			key:       key,
+			store:     store,
+			isRemoval: removalMap[key],
+		})
 	}
 
+	if len(jobs) == 0 {
+		return &types.CommitInfo{Version: version, StoreInfos: []types.StoreInfo{}}
+	}
+
+	// Commit stores in parallel (each IAVL Commit is independent).
+	type result struct {
+		name     string
+		id       types.CommitID
+		isRemoval bool
+	}
+	results := make([]result, len(jobs))
+	var wg sync.WaitGroup
+	for i, job := range jobs {
+		wg.Add(1)
+		go func(idx int, k types.StoreKey, s types.CommitKVStore, removal bool) {
+			defer wg.Done()
+			last := s.LastCommitID()
+			var commitID types.CommitID
+			if last.Version >= version {
+				last.Version = version
+				commitID = last
+			} else {
+				commitID = s.Commit()
+			}
+			results[idx] = result{name: k.Name(), id: commitID, isRemoval: removal}
+		}(i, job.key, job.store, job.isRemoval)
+	}
+	wg.Wait()
+
+	// Build storeInfos in deterministic order (sorted by name).
+	// Exclude removed stores from storeInfos.
+	storeInfos := make([]types.StoreInfo, 0, len(results))
+	for _, r := range results {
+		if !r.isRemoval {
+			storeInfos = append(storeInfos, types.StoreInfo{Name: r.name, CommitId: r.id})
+		}
+	}
 	sort.SliceStable(storeInfos, func(i, j int) bool {
 		return strings.Compare(storeInfos[i].Name, storeInfos[j].Name) < 0
 	})
