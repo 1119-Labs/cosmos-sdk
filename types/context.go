@@ -333,7 +333,12 @@ func (c Context) Value(key interface{}) interface{} {
 // ----------------------------------------------------------------------------
 
 // KVStore fetches a KVStore from the MultiStore.
+// Optimized: skips gaskv wrapping when all gas costs are zero (e.g., Block-STM
+// execution). Struct equality on 7 uint64 fields compiles to a single memcmp.
 func (c Context) KVStore(key storetypes.StoreKey) storetypes.KVStore {
+	if c.kvGasConfig == (storetypes.GasConfig{}) {
+		return c.ms.GetKVStore(key)
+	}
 	return gaskv.NewStore(c.ms.GetKVStore(key), c.gasMeter, c.kvGasConfig)
 }
 

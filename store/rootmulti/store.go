@@ -21,6 +21,7 @@ import (
 	"cosmossdk.io/store/cachemulti"
 	"cosmossdk.io/store/dbadapter"
 	"cosmossdk.io/store/iavl"
+	"cosmossdk.io/store/memiavl"
 	"cosmossdk.io/store/listenkv"
 	"cosmossdk.io/store/mem"
 	"cosmossdk.io/store/metrics"
@@ -74,6 +75,7 @@ type Store struct {
 	listeners           map[types.StoreKey]*types.MemoryListener
 	metrics             metrics.StoreMetrics
 	commitHeader        cmtproto.Header
+	useMemIAVL          bool
 }
 
 var (
@@ -130,6 +132,14 @@ func (rs *Store) SetIAVLCacheSize(cacheSize int) {
 
 func (rs *Store) SetIAVLDisableFastNode(disableFastNode bool) {
 	rs.iavlDisableFastNode = disableFastNode
+}
+
+// SetUseMemIAVL enables or disables MemIAVL as a drop-in replacement for IAVL stores.
+// When enabled, all stores mounted as StoreTypeIAVL will use in-memory AVL trees
+// instead of IAVL+LevelDB, eliminating disk I/O.
+// Must be called before LoadLatestVersion or LoadVersion.
+func (rs *Store) SetUseMemIAVL(useMemIAVL bool) {
+	rs.useMemIAVL = useMemIAVL
 }
 
 // GetStoreType implements Store.
@@ -1044,6 +1054,14 @@ func (rs *Store) loadCommitStoreFromParams(key types.StoreKey, id types.CommitID
 		panic("recursive MultiStores not yet supported")
 
 	case types.StoreTypeIAVL:
+		if rs.useMemIAVL {
+			store := memiavl.NewStore()
+			if params.initialVersion != 0 {
+				store.SetInitialVersion(int64(params.initialVersion))
+			}
+			return store, nil
+		}
+
 		var store types.CommitKVStore
 		var err error
 
