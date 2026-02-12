@@ -2,8 +2,6 @@ package memiavl
 
 import (
 	"bytes"
-	"encoding/binary"
-	"io"
 	"math"
 )
 
@@ -185,18 +183,6 @@ func (node *MemNode) GetByIndex(index uint32) ([]byte, []byte) {
 		return left.GetByIndex(index)
 	}
 	return node.Right().GetByIndex(index - leftSize)
-}
-
-// encodeBytes writes a varint length-prefixed byte slice to the writer.
-// Compatible with the official IAVL hash computation.
-func encodeBytes(w io.Writer, bz []byte) error {
-	var buf [binary.MaxVarintLen64]byte
-	n := binary.PutUvarint(buf[:], uint64(len(bz)))
-	if _, err := w.Write(buf[0:n]); err != nil {
-		return err
-	}
-	_, err := w.Write(bz)
-	return err
 }
 
 func maxUInt8(a, b uint8) uint8 {

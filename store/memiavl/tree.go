@@ -15,7 +15,9 @@ type Tree struct {
 	root           Node
 	initialVersion uint32
 	cowVersion     uint32
+	cachedRootHash []byte // set by RootHash(), cleared on mutation
 	mtx            sync.RWMutex
+	snapshot       *Snapshot // non-nil when loaded from a snapshot (Phase R)
 }
 
 // NewEmptyTree creates an empty tree at an arbitrary version.
@@ -37,6 +39,20 @@ func New() *Tree {
 // NewWithInitialVersion creates an empty tree with an initial version.
 func NewWithInitialVersion(initialVersion uint32) *Tree {
 	return NewEmptyTree(0, initialVersion)
+}
+
+// NewFromSnapshot creates a tree backed by a persisted snapshot.
+// The snapshot's nodes are accessed via mmap zero-copy reads.
+func NewFromSnapshot(snapshot *Snapshot) *Tree {
+	tree := &Tree{
+		version:  snapshot.version,
+		snapshot: snapshot,
+	}
+	if !snapshot.IsEmpty() {
+		root := snapshot.RootNode()
+		tree.root = root
+	}
+	return tree
 }
 
 func (t *Tree) IsEmpty() bool {
@@ -66,7 +82,18 @@ func (t *Tree) Copy() *Tree {
 		root:           t.root,
 		initialVersion: t.initialVersion,
 		cowVersion:     t.cowVersion,
+		snapshot:       t.snapshot,
 	}
+}
+
+// Close releases resources associated with the tree (e.g., mmap handles).
+func (t *Tree) Close() error {
+	if t.snapshot != nil {
+		err := t.snapshot.Close()
+		t.snapshot = nil
+		return err
+	}
+	return nil
 }
 
 // set is the internal implementation without locking.
@@ -74,11 +101,13 @@ func (t *Tree) set(key, value []byte) {
 	if value == nil {
 		value = []byte{}
 	}
+	t.cachedRootHash = nil // invalidate hash cache
 	t.root, _ = setRecursive(t.root, key, value, t.version+1, t.cowVersion)
 }
 
 // remove is the internal implementation without locking.
 func (t *Tree) remove(key []byte) {
+	t.cachedRootHash = nil // invalidate hash cache
 	_, t.root, _ = removeRecursive(t.root, key, t.version+1, t.cowVersion)
 }
 
@@ -117,13 +146,19 @@ func (t *Tree) Version() int64 {
 }
 
 // RootHash computes and returns the root hash.
+// Uses batch hashing (Phase O) to hash all dirty nodes with a single reused hasher.
 func (t *Tree) RootHash() []byte {
 	t.mtx.RLock()
 	defer t.mtx.RUnlock()
+	if t.cachedRootHash != nil {
+		return t.cachedRootHash
+	}
 	if t.root == nil {
 		return emptyHash
 	}
-	return t.root.SafeHash()
+	hashParallelSubtrees(t.root)
+	t.cachedRootHash = t.root.SafeHash()
+	return t.cachedRootHash
 }
 
 // Get returns the value for a key, or nil if not found.
@@ -147,6 +182,14 @@ func (t *Tree) Iterator(start, end []byte, ascending bool) *Iterator {
 	t.mtx.RLock()
 	defer t.mtx.RUnlock()
 	return NewIterator(start, end, ascending, t.root)
+}
+
+// UnsafeIterator returns an iterator where Key()/Value() return references
+// without cloning. For Block-STM use where MVKVStore handles cloning.
+func (t *Tree) UnsafeIterator(start, end []byte, ascending bool) *Iterator {
+	t.mtx.RLock()
+	defer t.mtx.RUnlock()
+	return NewUnsafeIterator(start, end, ascending, t.root)
 }
 
 // Size returns the number of keys in the tree.

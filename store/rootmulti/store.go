@@ -23,6 +23,7 @@ import (
 	"cosmossdk.io/store/iavl"
 	"cosmossdk.io/store/memiavl"
 	"cosmossdk.io/store/listenkv"
+	"cosmossdk.io/store/statestore"
 	"cosmossdk.io/store/mem"
 	"cosmossdk.io/store/metrics"
 	"cosmossdk.io/store/pruning"
@@ -76,6 +77,10 @@ type Store struct {
 	metrics             metrics.StoreMetrics
 	commitHeader        cmtproto.Header
 	useMemIAVL          bool
+	memiavlDir          string
+	memiavlConfig       memiavl.DBConfig
+	memiavlDB           *memiavl.DB
+	ssStore             statestore.StateStore // optional State Store for historical queries
 }
 
 var (
@@ -140,6 +145,20 @@ func (rs *Store) SetIAVLDisableFastNode(disableFastNode bool) {
 // Must be called before LoadLatestVersion or LoadVersion.
 func (rs *Store) SetUseMemIAVL(useMemIAVL bool) {
 	rs.useMemIAVL = useMemIAVL
+}
+
+// SetMemIAVLOptions configures MemIAVL persistence.
+// dir is the directory for snapshots and WAL. config controls snapshot interval, WAL buffer, etc.
+// If dir is empty, MemIAVL runs in pure in-memory mode (no persistence).
+func (rs *Store) SetMemIAVLOptions(dir string, config memiavl.DBConfig) {
+	rs.memiavlDir = dir
+	rs.memiavlConfig = config
+}
+
+// SetStateStore sets the State Store for historical versioned queries.
+// When set, changesets are written to the SS store asynchronously on each Commit.
+func (rs *Store) SetStateStore(ss statestore.StateStore) {
+	rs.ssStore = ss
 }
 
 // GetStoreType implements Store.
@@ -211,6 +230,11 @@ func (rs *Store) LoadVersion(ver int64) error {
 }
 
 func (rs *Store) loadVersion(ver int64, upgrades *types.StoreUpgrades) error {
+	// Persistent MemIAVL path: open DB, create stores from DB-managed trees.
+	if rs.useMemIAVL && rs.memiavlDir != "" {
+		return rs.loadVersionMemIAVL(ver, upgrades)
+	}
+
 	infos := make(map[string]types.StoreInfo)
 
 	rs.logger.Debug("loadVersion", "ver", ver)
@@ -489,9 +513,25 @@ func (rs *Store) Commit() types.CommitID {
 		rs.logger.Debug("commit header and version mismatch", "header_height", rs.commitHeader.Height, "version", version)
 	}
 
-	rs.lastCommitInfo = commitStores(version, rs.stores, rs.removalMap)
-	rs.lastCommitInfo.Timestamp = rs.commitHeader.Time
-	defer rs.flushMetadata(rs.db, version, rs.lastCommitInfo)
+	// Persistent MemIAVL path: collect changesets, delegate to DB.Commit().
+	if rs.memiavlDB != nil {
+		cInfo, changeSets := rs.commitMemIAVL(version)
+		cInfo.Timestamp = rs.commitHeader.Time
+		rs.lastCommitInfo = cInfo
+		defer rs.flushMetadata(rs.db, version, rs.lastCommitInfo)
+
+		// Async write to State Store if configured.
+		if rs.ssStore != nil && len(changeSets) > 0 {
+			ssChangeSets := memiavlToSSChangeSets(changeSets)
+			if err := rs.ssStore.ApplyChangesetAsync(version, ssChangeSets); err != nil {
+				rs.logger.Error("failed to write to state store", "err", err)
+			}
+		}
+	} else {
+		rs.lastCommitInfo = commitStores(version, rs.stores, rs.removalMap)
+		rs.lastCommitInfo.Timestamp = rs.commitHeader.Time
+		defer rs.flushMetadata(rs.db, version, rs.lastCommitInfo)
+	}
 
 	// remove remnants of removed stores
 	for sk := range rs.removalMap {
@@ -1327,4 +1367,176 @@ func flushLatestVersion(batch dbm.Batch, version int64) {
 	if err != nil {
 		panic(err)
 	}
+}
+
+// --- Persistent MemIAVL integration ---
+
+// loadVersionMemIAVL opens the memiavl.DB and creates stores from DB-managed trees.
+// Non-IAVL stores (transient, memory) are loaded normally.
+func (rs *Store) loadVersionMemIAVL(ver int64, upgrades *types.StoreUpgrades) error {
+	rs.logger.Debug("loadVersionMemIAVL", "ver", ver, "dir", rs.memiavlDir)
+
+	// Collect IAVL store names for DB initialization.
+	var iavlStoreNames []string
+	for _, key := range keysFromStoreKeyMap(rs.storesParams) {
+		params := rs.storesParams[key]
+		if params.typ == types.StoreTypeIAVL {
+			iavlStoreNames = append(iavlStoreNames, key.Name())
+		}
+	}
+
+	// Open or create the DB.
+	config := rs.memiavlConfig
+	config.InitialStores = iavlStoreNames
+	db, err := memiavl.OpenDB(rs.memiavlDir, config)
+	if err != nil {
+		return fmt.Errorf("open memiavl DB: %w", err)
+	}
+	rs.memiavlDB = db
+
+	// If initial version needs to be set on the DB trees.
+	if rs.initialVersion > 0 {
+		if err := db.MultiTree.SetInitialVersion(rs.initialVersion); err != nil {
+			return fmt.Errorf("set initial version: %w", err)
+		}
+	}
+
+	// Build commit info from DB-managed trees.
+	storeInfos := make([]types.StoreInfo, 0, len(iavlStoreNames))
+	newStores := make(map[types.StoreKey]types.CommitKVStore)
+
+	for _, key := range keysFromStoreKeyMap(rs.storesParams) {
+		params := rs.storesParams[key]
+
+		if params.typ == types.StoreTypeIAVL {
+			// Get tree from DB.
+			tree := db.MultiTree.TreeByName(key.Name())
+			if tree == nil {
+				return fmt.Errorf("memiavl DB missing tree for store: %s", key.Name())
+			}
+			store := memiavl.NewStoreFromTree(tree, true) // trackChanges=true for WAL
+			newStores[key] = store
+			storeInfos = append(storeInfos, types.StoreInfo{
+				Name: key.Name(),
+				CommitId: types.CommitID{
+					Version: tree.Version(),
+					Hash:    tree.RootHash(),
+				},
+			})
+		} else {
+			// Non-IAVL stores (transient, memory, etc.) load normally.
+			commitID := types.CommitID{}
+			store, err := rs.loadCommitStoreFromParams(key, commitID, params)
+			if err != nil {
+				return errorsmod.Wrapf(err, "failed to load non-IAVL store %s", key.Name())
+			}
+			newStores[key] = store
+		}
+	}
+
+	rs.stores = newStores
+	rs.lastCommitInfo = &types.CommitInfo{
+		Version:    db.CommittedVersion(),
+		StoreInfos: storeInfos,
+	}
+
+	// Load pruning data.
+	if err := rs.pruningManager.LoadSnapshotHeights(rs.db); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// commitMemIAVL collects changesets from memiavl stores and delegates to memiavlDB.Commit().
+// Returns CommitInfo built from tree hashes after commit.
+func (rs *Store) commitMemIAVL(version int64) (*types.CommitInfo, []memiavl.NamedChangeSet) {
+	// Collect changesets from all tracked memiavl stores.
+	var changeSets []memiavl.NamedChangeSet
+	storeKeys := keysFromStoreKeyMap(rs.stores)
+
+	for _, key := range storeKeys {
+		store := rs.stores[key]
+		if store.GetStoreType() != types.StoreTypeIAVL {
+			continue
+		}
+		if rs.removalMap[key] {
+			continue
+		}
+		ms, ok := store.(*memiavl.Store)
+		if !ok {
+			continue
+		}
+		changes := ms.FlushPendingChanges()
+		if len(changes) > 0 {
+			changeSets = append(changeSets, memiavl.NamedChangeSet{
+				Name:  key.Name(),
+				Pairs: changes,
+			})
+		}
+	}
+
+	// Delegate to DB.CommitWithoutApply — mutations already applied via Store.Set/Delete.
+	// This does SaveVersion + WAL write + snapshot lifecycle.
+	dbVersion, err := rs.memiavlDB.CommitWithoutApply(changeSets)
+	if err != nil {
+		panic(fmt.Errorf("memiavl DB commit: %w", err))
+	}
+
+	// Build CommitInfo from tree hashes and update each store's lastCommitID.
+	storeInfos := make([]types.StoreInfo, 0)
+	for _, key := range storeKeys {
+		store := rs.stores[key]
+		if store.GetStoreType() != types.StoreTypeIAVL {
+			continue
+		}
+		if rs.removalMap[key] {
+			continue
+		}
+		ms, ok := store.(*memiavl.Store)
+		if !ok {
+			continue
+		}
+		// Update the store's lastCommitID to reflect the DB's SaveVersion.
+		commitID := types.CommitID{
+			Version: dbVersion,
+			Hash:    ms.WorkingHash(),
+		}
+		ms.SetLastCommitID(commitID)
+		storeInfos = append(storeInfos, types.StoreInfo{
+			Name:     key.Name(),
+			CommitId: commitID,
+		})
+	}
+	sort.SliceStable(storeInfos, func(i, j int) bool {
+		return storeInfos[i].Name < storeInfos[j].Name
+	})
+
+	return &types.CommitInfo{
+		Version:    version,
+		StoreInfos: storeInfos,
+	}, changeSets
+}
+
+// memiavlToSSChangeSets converts memiavl changesets to statestore changesets.
+func memiavlToSSChangeSets(cs []memiavl.NamedChangeSet) []statestore.NamedChangeSet {
+	result := make([]statestore.NamedChangeSet, len(cs))
+	for i, c := range cs {
+		pairs := make([]statestore.KVPair, len(c.Pairs))
+		for j, p := range c.Pairs {
+			pairs[j] = statestore.KVPair{Key: p.Key, Value: p.Value, Delete: p.Delete}
+		}
+		result[i] = statestore.NamedChangeSet{Name: c.Name, Pairs: pairs}
+	}
+	return result
+}
+
+// CloseMemIAVL closes the persistent MemIAVL DB if open.
+func (rs *Store) CloseMemIAVL() error {
+	if rs.memiavlDB != nil {
+		err := rs.memiavlDB.Close()
+		rs.memiavlDB = nil
+		return err
+	}
+	return nil
 }

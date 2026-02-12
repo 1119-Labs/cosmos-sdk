@@ -9,6 +9,7 @@ type Iterator struct {
 	ascending  bool
 	key, value []byte
 	valid      bool
+	unsafeCopy bool // if true, Key()/Value() return references without cloning
 	stack      []Node
 }
 
@@ -32,8 +33,28 @@ func NewIterator(start, end []byte, ascending bool, root Node) *Iterator {
 func (iter *Iterator) Domain() ([]byte, []byte) { return iter.start, iter.end }
 func (iter *Iterator) Valid() bool               { return iter.valid }
 func (iter *Iterator) Error() error              { return nil }
-func (iter *Iterator) Key() []byte               { return cloneBytes(iter.key) }
-func (iter *Iterator) Value() []byte             { return cloneBytes(iter.value) }
+
+func (iter *Iterator) Key() []byte {
+	if iter.unsafeCopy {
+		return iter.key
+	}
+	return cloneBytes(iter.key)
+}
+
+func (iter *Iterator) Value() []byte {
+	if iter.unsafeCopy {
+		return iter.value
+	}
+	return cloneBytes(iter.value)
+}
+
+// NewUnsafeIterator creates an iterator where Key()/Value() return references
+// without cloning. For use by Block-STM where MVKVStore handles its own cloning.
+func NewUnsafeIterator(start, end []byte, ascending bool, root Node) *Iterator {
+	iter := NewIterator(start, end, ascending, root)
+	iter.unsafeCopy = true
+	return iter
+}
 
 // Next advances the iterator to the next key-value pair.
 func (iter *Iterator) Next() {

@@ -22,6 +22,11 @@ var (
 type Store struct {
 	tree         *Tree
 	lastCommitID types.CommitID
+
+	// Change tracking for WAL persistence.
+	// When trackChanges is true, Set/Delete/SetBatch record mutations.
+	trackChanges   bool
+	pendingChanges []KVPair
 }
 
 // NewStore creates a new MemIAVL store at genesis version.
@@ -53,9 +58,17 @@ func (s *Store) Set(key, value []byte) {
 	types.AssertValidKey(key)
 	types.AssertValidValue(value)
 	s.tree.Set(key, value)
+	if s.trackChanges {
+		s.pendingChanges = append(s.pendingChanges, KVPair{Key: key, Value: value})
+	}
 }
 
-func (s *Store) Delete(key []byte) { s.tree.Remove(key) }
+func (s *Store) Delete(key []byte) {
+	s.tree.Remove(key)
+	if s.trackChanges {
+		s.pendingChanges = append(s.pendingChanges, KVPair{Key: key, Delete: true})
+	}
+}
 
 // --- types.KVStore ---
 
@@ -65,6 +78,18 @@ func (s *Store) Iterator(start, end []byte) types.Iterator {
 
 func (s *Store) ReverseIterator(start, end []byte) types.Iterator {
 	return s.tree.Iterator(start, end, false)
+}
+
+// UnsafeIterator returns an ascending iterator where Key()/Value() return
+// references without cloning. For Block-STM use (MVKVStore handles cloning).
+func (s *Store) UnsafeIterator(start, end []byte) types.Iterator {
+	return s.tree.UnsafeIterator(start, end, true)
+}
+
+// UnsafeReverseIterator returns a descending iterator where Key()/Value() return
+// references without cloning. For Block-STM use (MVKVStore handles cloning).
+func (s *Store) UnsafeReverseIterator(start, end []byte) types.Iterator {
+	return s.tree.UnsafeIterator(start, end, false)
 }
 
 // --- types.Committer ---
@@ -108,6 +133,13 @@ func (s *Store) SetBatch(pairs []iavl.BatchPair) error {
 			s.tree.set(pairs[i].Key, pairs[i].Value)
 		}
 	}
+	if s.trackChanges {
+		for i := range pairs {
+			s.pendingChanges = append(s.pendingChanges, KVPair{
+				Key: pairs[i].Key, Value: pairs[i].Value, Delete: pairs[i].Delete,
+			})
+		}
+	}
 	return nil
 }
 
@@ -117,3 +149,34 @@ func (s *Store) IsInMemory() bool { return true }
 
 // Tree returns the underlying tree (for testing).
 func (s *Store) Tree() *Tree { return s.tree }
+
+// NewStoreFromTree creates a Store wrapping an existing tree (e.g., loaded from snapshot).
+// If trackChanges is true, mutations are recorded for WAL persistence.
+func NewStoreFromTree(tree *Tree, trackChanges bool) *Store {
+	return &Store{
+		tree: tree,
+		lastCommitID: types.CommitID{
+			Version: tree.Version(),
+			Hash:    tree.RootHash(),
+		},
+		trackChanges: trackChanges,
+	}
+}
+
+// SetTrackChanges enables or disables change tracking.
+func (s *Store) SetTrackChanges(track bool) {
+	s.trackChanges = track
+}
+
+// SetLastCommitID updates the store's last commit ID.
+// Used by rootmulti when DB.CommitWithoutApply handles SaveVersion centrally.
+func (s *Store) SetLastCommitID(id types.CommitID) {
+	s.lastCommitID = id
+}
+
+// FlushPendingChanges returns and clears the accumulated mutations since the last flush.
+func (s *Store) FlushPendingChanges() []KVPair {
+	changes := s.pendingChanges
+	s.pendingChanges = nil
+	return changes
+}
