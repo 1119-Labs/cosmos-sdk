@@ -667,6 +667,14 @@ func (rs *Store) CacheMultiStoreWithVersion(version int64) (types.CacheMultiStor
 			// it to get the underlying IAVL store.
 			store = rs.GetCommitKVStore(key)
 
+			// MemIAVL stores only hold the latest version in memory;
+			// historical queries are served by the state store layer.
+			// Return the current store to avoid a type-assertion panic.
+			if _, ok := store.(*memiavl.Store); ok {
+				cacheStore = store.(types.KVStore)
+				break
+			}
+
 			// Attempt to lazy-load an already saved IAVL store version. If the
 			// version does not exist or is pruned, an error should be returned.
 			var err error
@@ -775,6 +783,11 @@ func (rs *Store) PruneStores(pruningHeight int64) (err error) {
 		}
 
 		store = rs.GetCommitKVStore(key)
+
+		// MemIAVL handles pruning via its own snapshot lifecycle; skip here.
+		if _, ok := store.(*memiavl.Store); ok {
+			continue
+		}
 
 		err := store.(*iavl.Store).DeleteVersionsTo(pruningHeight)
 		if err == nil {
@@ -1022,7 +1035,12 @@ loop:
 				}
 				importer.Close()
 			}
-			store, ok := rs.GetStoreByName(item.Store.Name).(*iavl.Store)
+			rawStore := rs.GetStoreByName(item.Store.Name)
+			// MemIAVL stores do not support IAVL snapshot import.
+			if _, isMemiavl := rawStore.(*memiavl.Store); isMemiavl {
+				return snapshottypes.SnapshotItem{}, errorsmod.Wrapf(types.ErrLogic, "cannot import IAVL snapshot into memiavl store %q", item.Store.Name)
+			}
+			store, ok := rawStore.(*iavl.Store)
 			if !ok || store == nil {
 				return snapshottypes.SnapshotItem{}, errorsmod.Wrapf(types.ErrLogic, "cannot import into non-IAVL store %q", item.Store.Name)
 			}
@@ -1178,6 +1196,10 @@ func (rs *Store) RollbackToVersion(target int64) error {
 			// If the store is wrapped with an inter-block cache, we must first unwrap
 			// it to get the underlying IAVL store.
 			store = rs.GetCommitKVStore(key)
+			// MemIAVL does not support version rollback at the individual store level.
+			if _, ok := store.(*memiavl.Store); ok {
+				continue
+			}
 			err := store.(*iavl.Store).LoadVersionForOverwriting(target)
 			if err != nil {
 				return err

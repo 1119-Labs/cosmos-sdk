@@ -50,7 +50,7 @@ func DefaultDBConfig() DBConfig {
 		SnapshotInterval:        10000,
 		SnapshotKeepRecent:      1,
 		SnapshotMinTimeInterval: time.Hour,
-		WALBufferSize:           100,
+		WALBufferSize:           0, // sync writes — must reach disk before Commit returns
 		WALDir:                  "changelog",
 	}
 }
@@ -148,7 +148,10 @@ func (db *DB) replayWAL() error {
 		if err := db.MultiTree.ApplyChangeSets(entry.ChangeSets); err != nil {
 			return fmt.Errorf("apply changeset at version %d: %w", entry.Version, err)
 		}
-		if _, err := db.MultiTree.SaveVersion(false); err != nil {
+		// Compute hashes during replay to ensure the tree state is identical
+		// to what was committed originally. Without this, the hash computed later
+		// in loadVersionMemIAVL may differ from the original commit hash.
+		if _, err := db.MultiTree.SaveVersion(true); err != nil {
 			return fmt.Errorf("save version %d: %w", entry.Version, err)
 		}
 	}

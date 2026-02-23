@@ -99,7 +99,7 @@ func (w *WAL) Write(entry WALEntry) error {
 	return w.writeSync(entry)
 }
 
-// writeSync writes an entry synchronously.
+// writeSync writes an entry synchronously and fsyncs to ensure durability.
 func (w *WAL) writeSync(entry WALEntry) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -119,7 +119,9 @@ func (w *WAL) writeSync(entry WALEntry) error {
 	if _, err := w.currentFile.Write(data); err != nil {
 		return err
 	}
-	return nil
+	// fsync to guarantee the entry is on disk before Commit returns.
+	// Without this, a crash can lose WAL data causing app hash mismatch on replay.
+	return w.currentFile.Sync()
 }
 
 // asyncWriteLoop runs in a background goroutine for async writes.
