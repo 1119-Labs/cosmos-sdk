@@ -101,6 +101,10 @@ func (t *Tree) set(key, value []byte) {
 	if value == nil {
 		value = []byte{}
 	}
+	// Clone key/value so the tree owns its data. Callers may pass ephemeral
+	// buffers (e.g., arena-allocated slices in Block-STM) that get recycled.
+	key = cloneBytes(key)
+	value = cloneBytes(value)
 	t.cachedRootHash = nil // invalidate hash cache
 	t.root, _ = setRecursive(t.root, key, value, t.version+1, t.cowVersion)
 }

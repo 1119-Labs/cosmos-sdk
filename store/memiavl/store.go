@@ -59,14 +59,16 @@ func (s *Store) Set(key, value []byte) {
 	types.AssertValidValue(value)
 	s.tree.Set(key, value)
 	if s.trackChanges {
-		s.pendingChanges = append(s.pendingChanges, KVPair{Key: key, Value: value})
+		// Clone for pendingChanges: tree.set() clones internally, but
+		// pendingChanges needs its own copy since caller data may be ephemeral.
+		s.pendingChanges = append(s.pendingChanges, KVPair{Key: cloneBytes(key), Value: cloneBytes(value)})
 	}
 }
 
 func (s *Store) Delete(key []byte) {
 	s.tree.Remove(key)
 	if s.trackChanges {
-		s.pendingChanges = append(s.pendingChanges, KVPair{Key: key, Delete: true})
+		s.pendingChanges = append(s.pendingChanges, KVPair{Key: cloneBytes(key), Delete: true})
 	}
 }
 
@@ -136,7 +138,7 @@ func (s *Store) SetBatch(pairs []iavl.BatchPair) error {
 	if s.trackChanges {
 		for i := range pairs {
 			s.pendingChanges = append(s.pendingChanges, KVPair{
-				Key: pairs[i].Key, Value: pairs[i].Value, Delete: pairs[i].Delete,
+				Key: cloneBytes(pairs[i].Key), Value: cloneBytes(pairs[i].Value), Delete: pairs[i].Delete,
 			})
 		}
 	}
