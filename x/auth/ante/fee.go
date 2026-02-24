@@ -15,15 +15,24 @@ import (
 // the effective fee should be deducted later, and the priority should be returned in abci response.
 type TxFeeChecker func(ctx sdk.Context, tx sdk.Tx) (sdk.Coins, int64, error)
 
+// deferredFeeKeyType is the context key type for deferred fee amounts.
+type deferredFeeKeyType struct{}
+
+// DeferredFeeKey is the context value key for storing the deferred fee amount.
+// When DeferFeeCollection is enabled, the fee deducted from the sender is stored
+// here so the caller can aggregate fees after parallel execution.
+var DeferredFeeKey = deferredFeeKeyType{}
+
 // DeductFeeDecorator deducts fees from the fee payer. The fee payer is the fee granter (if specified) or first signer of the tx.
 // If the fee payer does not have the funds to pay for the fees, return an InsufficientFunds error.
 // Call next AnteHandler if fees successfully deducted.
 // CONTRACT: Tx must implement FeeTx interface to use DeductFeeDecorator
 type DeductFeeDecorator struct {
-	accountKeeper  AccountKeeper
-	bankKeeper     types.BankKeeper
-	feegrantKeeper FeegrantKeeper
-	txFeeChecker   TxFeeChecker
+	accountKeeper      AccountKeeper
+	bankKeeper         types.BankKeeper
+	feegrantKeeper     FeegrantKeeper
+	txFeeChecker       TxFeeChecker
+	DeferFeeCollection bool
 }
 
 func NewDeductFeeDecorator(ak AccountKeeper, bk types.BankKeeper, fk FeegrantKeeper, tfc TxFeeChecker) DeductFeeDecorator {
@@ -36,6 +45,24 @@ func NewDeductFeeDecorator(ak AccountKeeper, bk types.BankKeeper, fk FeegrantKee
 		bankKeeper:     bk,
 		feegrantKeeper: fk,
 		txFeeChecker:   tfc,
+	}
+}
+
+// NewDeferredDeductFeeDecorator creates a DeductFeeDecorator that only deducts
+// fees from the sender without crediting the fee_collector module account.
+// This eliminates the fee_collector write contention in Block-STM parallel execution.
+// The caller is responsible for aggregating and crediting fees after execution.
+func NewDeferredDeductFeeDecorator(ak AccountKeeper, bk types.BankKeeper, fk FeegrantKeeper, tfc TxFeeChecker) DeductFeeDecorator {
+	if tfc == nil {
+		tfc = checkTxFeeWithValidatorMinGasPrices
+	}
+
+	return DeductFeeDecorator{
+		accountKeeper:      ak,
+		bankKeeper:         bk,
+		feegrantKeeper:     fk,
+		txFeeChecker:       tfc,
+		DeferFeeCollection: true,
 	}
 }
 
@@ -108,9 +135,16 @@ func (dfd DeductFeeDecorator) checkDeductFee(ctx sdk.Context, sdkTx sdk.Tx, fee 
 
 	// deduct the fees
 	if !fee.IsZero() {
-		err := DeductFees(dfd.bankKeeper, ctx, deductFeesFromAcc, fee)
-		if err != nil {
-			return err
+		if dfd.DeferFeeCollection {
+			err := DeductFeesDeferred(dfd.bankKeeper, ctx, deductFeesFromAcc, fee)
+			if err != nil {
+				return err
+			}
+		} else {
+			err := DeductFees(dfd.bankKeeper, ctx, deductFeesFromAcc, fee)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -133,6 +167,25 @@ func DeductFees(bankKeeper types.BankKeeper, ctx sdk.Context, acc sdk.AccountI, 
 	}
 
 	err := bankKeeper.SendCoinsFromAccountToModule(ctx, acc.GetAddress(), types.FeeCollectorName, fees)
+	if err != nil {
+		return errorsmod.Wrapf(sdkerrors.ErrInsufficientFunds, err.Error())
+	}
+
+	return nil
+}
+
+// DeductFeesDeferred deducts fees from the sender account only (no fee_collector credit).
+// This is used by Block-STM parallel execution to eliminate the fee_collector write
+// contention. The fee_collector balance is never read during tx execution — only read
+// at BeginBlock of the next block by the distribution module's AllocateTokens().
+// The caller must aggregate all deferred fees and credit fee_collector once after
+// parallel execution completes.
+func DeductFeesDeferred(bankKeeper types.BankKeeper, ctx sdk.Context, acc sdk.AccountI, fees sdk.Coins) error {
+	if !fees.IsValid() {
+		return errorsmod.Wrapf(sdkerrors.ErrInsufficientFee, "invalid fee amount: %s", fees)
+	}
+
+	err := bankKeeper.SubUnlockedCoins(ctx, acc.GetAddress(), fees)
 	if err != nil {
 		return errorsmod.Wrapf(sdkerrors.ErrInsufficientFunds, err.Error())
 	}

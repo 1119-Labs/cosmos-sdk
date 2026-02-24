@@ -28,6 +28,8 @@ type SendKeeper interface {
 
 	InputOutputCoins(ctx context.Context, input types.Input, outputs []types.Output) error
 	SendCoins(ctx context.Context, fromAddr, toAddr sdk.AccAddress, amt sdk.Coins) error
+	SubUnlockedCoins(ctx context.Context, addr sdk.AccAddress, amt sdk.Coins) error
+	AddCoins(ctx context.Context, addr sdk.AccAddress, amt sdk.Coins) error
 
 	GetParams(ctx context.Context) types.Params
 	SetParams(ctx context.Context, params types.Params) error
@@ -251,6 +253,14 @@ func (k BaseSendKeeper) SendCoins(ctx context.Context, fromAddr, toAddr sdk.AccA
 	return nil
 }
 
+// SubUnlockedCoins is the public wrapper for subUnlockedCoins.
+// It removes the unlocked amt coins of the given account without crediting
+// any recipient. Used by deferred fee collection in Block-STM to deduct fees
+// from the sender without writing to the fee_collector module account.
+func (k BaseSendKeeper) SubUnlockedCoins(ctx context.Context, addr sdk.AccAddress, amt sdk.Coins) error {
+	return k.subUnlockedCoins(ctx, addr, amt)
+}
+
 // subUnlockedCoins removes the unlocked amt coins of the given account. An error is
 // returned if the resulting balance is negative or the initial amount is invalid.
 // A coin_spent event is emitted after.
@@ -295,6 +305,14 @@ func (k BaseSendKeeper) subUnlockedCoins(ctx context.Context, addr sdk.AccAddres
 	)
 
 	return nil
+}
+
+// AddCoins is the public wrapper for addCoins.
+// It increases the addr balance by the given amt. Used by deferred fee
+// collection in Block-STM to credit the fee_collector in a single write
+// after all parallel tx execution completes.
+func (k BaseSendKeeper) AddCoins(ctx context.Context, addr sdk.AccAddress, amt sdk.Coins) error {
+	return k.addCoins(ctx, addr, amt)
 }
 
 // addCoins increase the addr balance by the given amt. Fails if the provided
