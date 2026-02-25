@@ -828,6 +828,7 @@ func (app *BaseApp) internalFinalizeBlock(ctx context.Context, req *abci.Request
 	// the default sequential loop. On error, fall back to sequential.
 	var txResults []*abci.ExecTxResult
 
+	execStart := time.Now()
 	if app.parallelTxExecutor != nil {
 		parallelResults, parallelErr := app.parallelTxExecutor(
 			app.finalizeBlockState.Context(),
@@ -842,6 +843,16 @@ func (app *BaseApp) internalFinalizeBlock(ctx context.Context, req *abci.Request
 		}
 	} else {
 		txResults = app.executeTxsSequentially(ctx, req.Txs)
+	}
+	execDuration := time.Since(execStart)
+	if len(req.Txs) > 5 {
+		mode := "sequential"
+		if app.parallelTxExecutor != nil {
+			mode = "parallel"
+		}
+		app.logger.Info(fmt.Sprintf("FinalizeBlock tx execution: %d txs in %v (%s, %.0f txs/s)",
+			len(req.Txs), execDuration.Round(time.Millisecond), mode,
+			float64(len(req.Txs))/execDuration.Seconds()))
 	}
 
 	if app.finalizeBlockState.ms.TracingEnabled() {
