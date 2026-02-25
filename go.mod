@@ -200,4 +200,6 @@ retract (
 
 replace github.com/cometbft/cometbft => github.com/dydxprotocol/cometbft v0.38.6-0.20251014202517-0235a938b029
 
-replace cosmossdk.io/store => github.com/dydxprotocol/cosmos-sdk/store v1.0.3-0.20240326190927-d35618165018
+replace cosmossdk.io/store => ./store
+
+replace github.com/cosmos/iavl => /data/1119/iavl

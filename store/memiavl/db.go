@@ -71,6 +71,9 @@ type DB struct {
 	lastSnapshotTime          time.Time
 	snapshotVersion           int64 // version of the current snapshot on disk
 
+	// Pipelined commit: async persist result from PersistAsync.
+	persistDone chan error
+
 	mtx    sync.Mutex
 	closed bool
 }
@@ -240,6 +243,72 @@ func (db *DB) CommitWithoutApply(changeSets []NamedChangeSet) (int64, error) {
 	}
 
 	return version, nil
+}
+
+// CommitFastWithoutApply performs SaveVersion only (CPU-bound hash computation)
+// without WAL write or snapshot lifecycle. Used by pipelined commit to return
+// the commit hash quickly while deferring I/O to PersistAsync.
+func (db *DB) CommitFastWithoutApply() (int64, error) {
+	db.mtx.Lock()
+	defer db.mtx.Unlock()
+
+	if db.closed {
+		return 0, errors.New("db is closed")
+	}
+
+	// SaveVersion — increment version and compute hashes (CPU only).
+	version, err := db.MultiTree.SaveVersion(true)
+	if err != nil {
+		return 0, fmt.Errorf("save version: %w", err)
+	}
+
+	return version, nil
+}
+
+// PersistAsync starts a background goroutine to write WAL and handle snapshot
+// lifecycle for the given version and changesets. Call WaitPersist before the
+// next commit to ensure completion.
+func (db *DB) PersistAsync(version int64, changeSets []NamedChangeSet) {
+	done := make(chan error, 1)
+	db.persistDone = done
+
+	go func() {
+		db.mtx.Lock()
+		defer db.mtx.Unlock()
+
+		var err error
+		defer func() { done <- err }()
+
+		// Write to WAL.
+		entry := WALEntry{Version: version, ChangeSets: changeSets}
+		if err = db.wal.Write(entry); err != nil {
+			err = fmt.Errorf("write WAL: %w", err)
+			return
+		}
+
+		// Check for async snapshot rewrite completion.
+		if err = db.checkBackgroundSnapshotRewrite(); err != nil {
+			err = fmt.Errorf("check snapshot rewrite: %w", err)
+			return
+		}
+
+		// Trigger new snapshot rewrite if applicable.
+		if err = db.rewriteIfApplicable(version); err != nil {
+			err = fmt.Errorf("rewrite snapshot: %w", err)
+			return
+		}
+	}()
+}
+
+// WaitPersist blocks until the pending PersistAsync completes.
+// Returns any error from the async persist. No-op if no persist is pending.
+func (db *DB) WaitPersist() error {
+	if db.persistDone == nil {
+		return nil
+	}
+	err := <-db.persistDone
+	db.persistDone = nil
+	return err
 }
 
 // CommittedVersion returns the latest committed version.

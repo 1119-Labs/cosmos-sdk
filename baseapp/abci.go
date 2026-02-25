@@ -899,6 +899,14 @@ func (app *BaseApp) FinalizeBlock(req *abci.RequestFinalizeBlock) (res *abci.Res
 	app.mtx.Lock()
 	defer app.mtx.Unlock()
 
+	// Pipelined commit barrier: ensure previous block's async WAL/metadata
+	// I/O completed before starting the new block.
+	if rms, ok := app.cms.(*rootmulti.Store); ok {
+		if err := rms.WaitPersist(); err != nil {
+			return nil, fmt.Errorf("wait persist: %w", err)
+		}
+	}
+
 	defer func() {
 		// call the streaming service hooks with the FinalizeBlock messages
 		for _, streamingListener := range app.streamingManager.ABCIListeners {

@@ -81,6 +81,8 @@ type Store struct {
 	memiavlConfig       memiavl.DBConfig
 	memiavlDB           *memiavl.DB
 	ssStore             statestore.StateStore // optional State Store for historical queries
+	pipelinedCommit     bool                  // enable pipelined commit (async WAL/metadata)
+	metadataDone        chan struct{}          // signals metadata flush completion
 }
 
 var (
@@ -159,6 +161,14 @@ func (rs *Store) SetMemIAVLOptions(dir string, config memiavl.DBConfig) {
 // When set, changesets are written to the SS store asynchronously on each Commit.
 func (rs *Store) SetStateStore(ss statestore.StateStore) {
 	rs.ssStore = ss
+}
+
+// SetPipelinedCommit enables or disables pipelined commit mode.
+// When enabled, Commit() performs only CPU-bound SaveVersion synchronously,
+// deferring WAL fsync and metadata flush to a background goroutine.
+// WaitPersist() must be called before the next block starts.
+func (rs *Store) SetPipelinedCommit(enabled bool) {
+	rs.pipelinedCommit = enabled
 }
 
 // GetStoreType implements Store.
@@ -515,16 +525,23 @@ func (rs *Store) Commit() types.CommitID {
 
 	// Persistent MemIAVL path: collect changesets, delegate to DB.Commit().
 	if rs.memiavlDB != nil {
-		cInfo, changeSets := rs.commitMemIAVL(version)
-		cInfo.Timestamp = rs.commitHeader.Time
-		rs.lastCommitInfo = cInfo
-		defer rs.flushMetadata(rs.db, version, rs.lastCommitInfo)
+		if rs.pipelinedCommit {
+			cInfo, changeSets := rs.commitMemIAVLFast(version)
+			cInfo.Timestamp = rs.commitHeader.Time
+			rs.lastCommitInfo = cInfo
+			rs.startAsyncPersist(version, changeSets)
+		} else {
+			cInfo, changeSets := rs.commitMemIAVL(version)
+			cInfo.Timestamp = rs.commitHeader.Time
+			rs.lastCommitInfo = cInfo
+			defer rs.flushMetadata(rs.db, version, rs.lastCommitInfo)
 
-		// Async write to State Store if configured.
-		if rs.ssStore != nil && len(changeSets) > 0 {
-			ssChangeSets := memiavlToSSChangeSets(changeSets)
-			if err := rs.ssStore.ApplyChangesetAsync(version, ssChangeSets); err != nil {
-				rs.logger.Error("failed to write to state store", "err", err)
+			// Async write to State Store if configured.
+			if rs.ssStore != nil && len(changeSets) > 0 {
+				ssChangeSets := memiavlToSSChangeSets(changeSets)
+				if err := rs.ssStore.ApplyChangesetAsync(version, ssChangeSets); err != nil {
+					rs.logger.Error("failed to write to state store", "err", err)
+				}
 			}
 		}
 	} else {
@@ -1538,6 +1555,120 @@ func (rs *Store) commitMemIAVL(version int64) (*types.CommitInfo, []memiavl.Name
 		Version:    version,
 		StoreInfos: storeInfos,
 	}, changeSets
+}
+
+// commitMemIAVLFast performs only the CPU-bound SaveVersion (hash computation)
+// without WAL write or snapshot lifecycle. Used by pipelined commit.
+func (rs *Store) commitMemIAVLFast(version int64) (*types.CommitInfo, []memiavl.NamedChangeSet) {
+	// Collect changesets from all tracked memiavl stores.
+	var changeSets []memiavl.NamedChangeSet
+	storeKeys := keysFromStoreKeyMap(rs.stores)
+
+	for _, key := range storeKeys {
+		store := rs.stores[key]
+		if store.GetStoreType() != types.StoreTypeIAVL {
+			continue
+		}
+		if rs.removalMap[key] {
+			continue
+		}
+		ms, ok := store.(*memiavl.Store)
+		if !ok {
+			continue
+		}
+		changes := ms.FlushPendingChanges()
+		if len(changes) > 0 {
+			changeSets = append(changeSets, memiavl.NamedChangeSet{
+				Name:  key.Name(),
+				Pairs: changes,
+			})
+		}
+	}
+
+	// CPU-only: SaveVersion computes hashes, no WAL write.
+	dbVersion, err := rs.memiavlDB.CommitFastWithoutApply()
+	if err != nil {
+		panic(fmt.Errorf("memiavl DB commit fast: %w", err))
+	}
+
+	// Build CommitInfo from tree hashes and update each store's lastCommitID.
+	storeInfos := make([]types.StoreInfo, 0)
+	for _, key := range storeKeys {
+		store := rs.stores[key]
+		if store.GetStoreType() != types.StoreTypeIAVL {
+			continue
+		}
+		if rs.removalMap[key] {
+			continue
+		}
+		ms, ok := store.(*memiavl.Store)
+		if !ok {
+			continue
+		}
+		commitID := types.CommitID{
+			Version: dbVersion,
+			Hash:    ms.WorkingHash(),
+		}
+		ms.SetLastCommitID(commitID)
+		storeInfos = append(storeInfos, types.StoreInfo{
+			Name:     key.Name(),
+			CommitId: commitID,
+		})
+	}
+	sort.SliceStable(storeInfos, func(i, j int) bool {
+		return storeInfos[i].Name < storeInfos[j].Name
+	})
+
+	return &types.CommitInfo{
+		Version:    version,
+		StoreInfos: storeInfos,
+	}, changeSets
+}
+
+// startAsyncPersist launches background goroutines for WAL write, metadata flush,
+// and state store changeset application. Called during pipelined commit.
+func (rs *Store) startAsyncPersist(version int64, changeSets []memiavl.NamedChangeSet) {
+	// Start memiavl WAL + snapshot lifecycle in background.
+	rs.memiavlDB.PersistAsync(version, changeSets)
+
+	// Start metadata flush in background.
+	metaDone := make(chan struct{}, 1)
+	rs.metadataDone = metaDone
+	cInfo := rs.lastCommitInfo
+	go func() {
+		defer func() { metaDone <- struct{}{} }()
+		rs.flushMetadata(rs.db, version, cInfo)
+	}()
+
+	// Async write to State Store if configured.
+	if rs.ssStore != nil && len(changeSets) > 0 {
+		ssChangeSets := memiavlToSSChangeSets(changeSets)
+		if err := rs.ssStore.ApplyChangesetAsync(version, ssChangeSets); err != nil {
+			rs.logger.Error("failed to write to state store", "err", err)
+		}
+	}
+}
+
+// WaitPersist blocks until all pending async persistence from pipelined commit
+// completes. Must be called before the next block's FinalizeBlock starts.
+// No-op if no pipelined commit is pending.
+func (rs *Store) WaitPersist() error {
+	if !rs.pipelinedCommit {
+		return nil
+	}
+
+	// Wait for memiavl WAL + snapshot.
+	if err := rs.memiavlDB.WaitPersist(); err != nil {
+		return fmt.Errorf("memiavl persist: %w", err)
+	}
+
+	// Wait for metadata flush.
+	if rs.metadataDone != nil {
+		<-rs.metadataDone
+		rs.metadataDone = nil
+	}
+
+	return nil
 }
 
 // memiavlToSSChangeSets converts memiavl changesets to statestore changesets.
