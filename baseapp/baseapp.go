@@ -593,6 +593,11 @@ func (app *BaseApp) AddRunTxRecoveryHandler(handlers ...RecoveryHandler) {
 	}
 }
 
+// GetIndexEvents returns the set of events to index. An empty map means index all.
+func (app *BaseApp) GetIndexEvents() map[string]struct{} {
+	return app.indexEvents
+}
+
 // GetMaximumBlockGas gets the maximum gas from the consensus params. It panics
 // if maximum block gas is less than negative one and returns zero if negative
 // one.
