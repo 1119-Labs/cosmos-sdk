@@ -1483,6 +1483,11 @@ func (rs *Store) commitMemIAVL(version int64) (*types.CommitInfo, []memiavl.Name
 
 	for _, key := range storeKeys {
 		store := rs.stores[key]
+		// Transient and memory stores must be committed (reset) even in MemIAVL mode.
+		if store.GetStoreType() == types.StoreTypeTransient || store.GetStoreType() == types.StoreTypeMemory {
+			store.Commit()
+			continue
+		}
 		if store.GetStoreType() != types.StoreTypeIAVL {
 			continue
 		}
