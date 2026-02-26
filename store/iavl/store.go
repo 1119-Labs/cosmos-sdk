@@ -222,6 +222,18 @@ func (st *Store) Delete(key []byte) {
 	}
 }
 
+// SetBatch applies multiple sorted key-value pairs efficiently using the IAVL
+// tree's batch mode, which enables skip-clone optimization for unsaved nodes.
+// Pairs with nil value are treated as deletes.
+// Returns an error if the underlying tree is not a MutableTree.
+func (st *Store) SetBatch(pairs []iavl.BatchPair) error {
+	mt, ok := st.tree.(*iavl.MutableTree)
+	if !ok {
+		return fmt.Errorf("SetBatch requires a MutableTree, got %T", st.tree)
+	}
+	return mt.SetBatch(pairs)
+}
+
 // DeleteVersionsTo deletes versions upto the given version from the MutableTree. An error
 // is returned if any single version is invalid or the delete fails. All writes
 // happen in a single batch with a single commit.

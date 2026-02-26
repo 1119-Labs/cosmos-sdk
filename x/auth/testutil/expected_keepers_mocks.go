@@ -81,3 +81,31 @@ func (mr *MockBankKeeperMockRecorder) SendCoinsFromAccountToModule(ctx, senderAd
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SendCoinsFromAccountToModule", reflect.TypeOf((*MockBankKeeper)(nil).SendCoinsFromAccountToModule), ctx, senderAddr, recipientModule, amt)
 }
+
+// SubUnlockedCoins mocks base method.
+func (m *MockBankKeeper) SubUnlockedCoins(ctx context.Context, addr types.AccAddress, amt types.Coins) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SubUnlockedCoins", ctx, addr, amt)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// SubUnlockedCoins indicates an expected call of SubUnlockedCoins.
+func (mr *MockBankKeeperMockRecorder) SubUnlockedCoins(ctx, addr, amt interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SubUnlockedCoins", reflect.TypeOf((*MockBankKeeper)(nil).SubUnlockedCoins), ctx, addr, amt)
+}
+
+// AddCoins mocks base method.
+func (m *MockBankKeeper) AddCoins(ctx context.Context, addr types.AccAddress, amt types.Coins) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "AddCoins", ctx, addr, amt)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// AddCoins indicates an expected call of AddCoins.
+func (mr *MockBankKeeperMockRecorder) AddCoins(ctx, addr, amt interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AddCoins", reflect.TypeOf((*MockBankKeeper)(nil).AddCoins), ctx, addr, amt)
+}

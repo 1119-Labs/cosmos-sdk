@@ -2,6 +2,7 @@ package gaskv
 
 import (
 	"io"
+	"sync"
 
 	"cosmossdk.io/store/types"
 )
@@ -16,14 +17,31 @@ type Store struct {
 	parent    types.KVStore
 }
 
+// gaskv pool reduces GC pressure from frequent NewStore calls (e.g., Block-STM
+// workers calling ctx.KVStore() on every store access).
+var storePool = sync.Pool{
+	New: func() interface{} {
+		return &Store{}
+	},
+}
+
 // NewStore returns a reference to a new GasKVStore.
+// Uses a pool to reduce allocations in hot paths like Block-STM execution.
 func NewStore(parent types.KVStore, gasMeter types.GasMeter, gasConfig types.GasConfig) *Store {
-	kvs := &Store{
-		gasMeter:  gasMeter,
-		gasConfig: gasConfig,
-		parent:    parent,
-	}
+	kvs := storePool.Get().(*Store)
+	kvs.gasMeter = gasMeter
+	kvs.gasConfig = gasConfig
+	kvs.parent = parent
 	return kvs
+}
+
+// Release returns the Store to the pool for reuse.
+// Callers that obtained a Store via NewStore should call Release when done.
+// If Release is never called, the Store is simply GC'd (pool is optional).
+func (gs *Store) Release() {
+	gs.gasMeter = nil
+	gs.parent = nil
+	storePool.Put(gs)
 }
 
 // Implements Store.

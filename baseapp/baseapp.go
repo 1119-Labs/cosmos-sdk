@@ -206,6 +206,12 @@ type BaseApp struct {
 	cacheMsWithVersionMtx sync.Mutex
 
 	blockDelayGetter sdk.BlockDelayGetter
+
+	// parallelTxExecutor, if set, replaces the sequential tx execution loop
+	// in internalFinalizeBlock with parallel execution (e.g., Block-STM).
+	// The function receives the finalize block context and the raw tx bytes,
+	// and returns the execution results in the same order as the input txs.
+	parallelTxExecutor func(ctx sdk.Context, txs [][]byte) ([]*abci.ExecTxResult, error)
 }
 
 // NewBaseApp returns a reference to an initialized BaseApp. It accepts a
@@ -815,6 +821,38 @@ func (app *BaseApp) deliverTx(tx []byte) *abci.ExecTxResult {
 	}
 
 	return resp
+}
+
+// executeTxsSequentially runs all transactions in order, one at a time.
+// This is the default execution mode used when no parallel executor is set.
+func (app *BaseApp) executeTxsSequentially(ctx context.Context, txs [][]byte) []*abci.ExecTxResult {
+	txResults := make([]*abci.ExecTxResult, 0, len(txs))
+	for _, rawTx := range txs {
+		var response *abci.ExecTxResult
+
+		if _, err := app.txDecoder(rawTx); err == nil {
+			response = app.deliverTx(rawTx)
+		} else {
+			response = sdkerrors.ResponseExecTxResultWithEvents(
+				sdkerrors.ErrTxDecode,
+				0,
+				0,
+				nil,
+				false,
+			)
+		}
+
+		// check after every tx if we should abort
+		select {
+		case <-ctx.Done():
+			return txResults
+		default:
+			// continue
+		}
+
+		txResults = append(txResults, response)
+	}
+	return txResults
 }
 
 // endBlock is an application-defined function that is called after transactions
