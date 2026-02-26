@@ -1310,6 +1310,10 @@ func commitStores(version int64, storeMap map[types.StoreKey]types.CommitKVStore
 	for _, key := range storeKeys {
 		store := storeMap[key]
 		if store.GetStoreType() == types.StoreTypeTransient || store.GetStoreType() == types.StoreTypeMemory {
+			// Commit transient/memory stores to reset their state (e.g., MemDB replacement).
+			// The original commitStores called Commit() on all stores before skipping
+			// transient/memory for storeInfos. We must preserve this reset behavior.
+			store.Commit()
 			continue
 		}
 		jobs = append(jobs, storeCommitJob{
