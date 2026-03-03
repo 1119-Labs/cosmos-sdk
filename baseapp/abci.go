@@ -830,8 +830,14 @@ func (app *BaseApp) internalFinalizeBlock(ctx context.Context, req *abci.Request
 
 	execStart := time.Now()
 	if app.parallelTxExecutor != nil {
+		// Pass the OE cancellation context into the SDK context so Block-STM
+		// can detect OE abort and ForceStop promptly (~200-500ms saved).
+		execCtx := app.finalizeBlockState.Context()
+		if ctx != nil {
+			execCtx = execCtx.WithContext(ctx)
+		}
 		parallelResults, parallelErr := app.parallelTxExecutor(
-			app.finalizeBlockState.Context(),
+			execCtx,
 			req.Txs,
 		)
 		if parallelErr != nil {
