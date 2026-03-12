@@ -836,3 +836,114 @@ func TestMultiTreeWriteSnapshotLoadCheckFiles(t *testing.T) {
 		require.NoError(t, err, "missing: %s", path)
 	}
 }
+
+// --- WAL TruncateAfter Tests ---
+
+func TestWALTruncateAfter(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := OpenWAL(dir, 0)
+	require.NoError(t, err)
+
+	// Write 5 entries (versions 1-5).
+	for i := int64(1); i <= 5; i++ {
+		err := wal.Write(WALEntry{
+			Version: i,
+			ChangeSets: []NamedChangeSet{{
+				Name:  "store",
+				Pairs: []KVPair{{Key: []byte("k"), Value: []byte{byte(i)}}},
+			}},
+		})
+		require.NoError(t, err)
+	}
+
+	// Truncate after version 3.
+	err = wal.TruncateAfter(3)
+	require.NoError(t, err)
+
+	// Read back — should only have versions 1-3.
+	entries, err := wal.ReadAll()
+	require.NoError(t, err)
+	require.Len(t, entries, 3)
+	require.Equal(t, int64(1), entries[0].Version)
+	require.Equal(t, int64(2), entries[1].Version)
+	require.Equal(t, int64(3), entries[2].Version)
+
+	require.NoError(t, wal.Close())
+}
+
+// --- DB Rollback Tests ---
+
+func TestDBRollback(t *testing.T) {
+	dir := t.TempDir()
+	config := DefaultDBConfig()
+	config.InitialStores = []string{"bank", "staking"}
+	config.SnapshotInterval = 0 // no auto-snapshots
+
+	db, err := OpenDB(dir, config)
+	require.NoError(t, err)
+
+	// Commit 5 versions with different values.
+	for i := int64(1); i <= 5; i++ {
+		_, err := db.Commit([]NamedChangeSet{
+			{Name: "bank", Pairs: []KVPair{{Key: []byte("balance"), Value: []byte{byte(i * 10)}}}},
+			{Name: "staking", Pairs: []KVPair{{Key: []byte("power"), Value: []byte{byte(i)}}}},
+		})
+		require.NoError(t, err)
+	}
+	require.Equal(t, int64(5), db.CommittedVersion())
+
+	// Rollback to version 3.
+	err = db.Rollback(3)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), db.CommittedVersion())
+
+	// Verify data matches version 3 state.
+	bankTree := db.MultiTree.TreeByName("bank")
+	require.NotNil(t, bankTree)
+	val := bankTree.Get([]byte("balance"))
+	require.Equal(t, []byte{30}, val) // 3 * 10
+
+	stakingTree := db.MultiTree.TreeByName("staking")
+	require.NotNil(t, stakingTree)
+	val = stakingTree.Get([]byte("power"))
+	require.Equal(t, []byte{3}, val)
+
+	// Close and reopen — should still be at version 3.
+	require.NoError(t, db.Close())
+
+	db2, err := OpenDB(dir, config)
+	require.NoError(t, err)
+	defer db2.Close()
+
+	require.Equal(t, int64(3), db2.CommittedVersion())
+
+	bankTree = db2.MultiTree.TreeByName("bank")
+	val = bankTree.Get([]byte("balance"))
+	require.Equal(t, []byte{30}, val)
+}
+
+func TestDBRollbackNoOp(t *testing.T) {
+	dir := t.TempDir()
+	config := DefaultDBConfig()
+	config.InitialStores = []string{"store1"}
+	config.SnapshotInterval = 0
+
+	db, err := OpenDB(dir, config)
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Commit([]NamedChangeSet{
+		{Name: "store1", Pairs: []KVPair{{Key: []byte("k"), Value: []byte("v")}}},
+	})
+	require.NoError(t, err)
+
+	// Rollback to current version — should be a no-op.
+	err = db.Rollback(1)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), db.CommittedVersion())
+
+	// Rollback to future version — also no-op.
+	err = db.Rollback(100)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), db.CommittedVersion())
+}

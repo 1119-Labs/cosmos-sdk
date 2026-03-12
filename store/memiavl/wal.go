@@ -199,6 +199,90 @@ func (w *WAL) TruncateBefore(version int64) error {
 	return nil
 }
 
+// TruncateAfter removes all WAL entries with version > targetVersion.
+// Segments whose first version > targetVersion are removed entirely.
+// The segment containing targetVersion is rewritten to keep only entries <= targetVersion.
+func (w *WAL) TruncateAfter(targetVersion int64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// Close current file handle first — it may be rewritten or removed.
+	if w.currentFile != nil {
+		_ = w.currentFile.Sync()
+		_ = w.currentFile.Close()
+		w.currentFile = nil
+	}
+
+	segments, err := w.listSegments()
+	if err != nil {
+		return err
+	}
+
+	for _, seg := range segments {
+		segVer := segmentVersion(seg)
+		segPath := filepath.Join(w.dir, seg)
+
+		if segVer > targetVersion {
+			// Entire segment is after target — remove it.
+			if err := os.Remove(segPath); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			continue
+		}
+
+		// This segment starts at or before targetVersion. Read entries and
+		// check if any are after targetVersion — if so, rewrite the segment.
+		entries, err := w.readSegment(seg)
+		if err != nil {
+			return fmt.Errorf("read segment %s for truncation: %w", seg, err)
+		}
+
+		var keep []WALEntry
+		needsRewrite := false
+		for _, e := range entries {
+			if e.Version <= targetVersion {
+				keep = append(keep, e)
+			} else {
+				needsRewrite = true
+			}
+		}
+
+		if !needsRewrite {
+			continue
+		}
+
+		// Remove the original segment.
+		if err := os.Remove(segPath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+
+		// Rewrite with only the kept entries.
+		if len(keep) > 0 {
+			if err := w.openNewSegment(keep[0].Version); err != nil {
+				return err
+			}
+			for _, e := range keep {
+				data := marshalWALEntry(e)
+				var lenBuf [4]byte
+				binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(data)))
+				if _, err := w.currentFile.Write(lenBuf[:]); err != nil {
+					return err
+				}
+				if _, err := w.currentFile.Write(data); err != nil {
+					return err
+				}
+			}
+			if err := w.currentFile.Sync(); err != nil {
+				return err
+			}
+			_ = w.currentFile.Close()
+			w.currentFile = nil
+		}
+	}
+
+	return nil
+}
+
 // Close flushes pending writes and closes the WAL.
 func (w *WAL) Close() error {
 	w.mu.Lock()

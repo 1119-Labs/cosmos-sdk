@@ -1191,15 +1191,20 @@ func (rs *Store) RollbackToVersion(target int64) error {
 		return fmt.Errorf("invalid rollback height target: %d", target)
 	}
 
+	// MemIAVL rollback: use DB.Rollback() instead of per-store rollback.
+	if rs.useMemIAVL && rs.memiavlDB != nil {
+		if err := rs.memiavlDB.Rollback(target); err != nil {
+			return fmt.Errorf("memiavl rollback to %d: %w", target, err)
+		}
+		rs.flushMetadata(rs.db, target, rs.buildCommitInfo(target))
+		return rs.LoadLatestVersion()
+	}
+
 	for key, store := range rs.stores {
 		if store.GetStoreType() == types.StoreTypeIAVL {
 			// If the store is wrapped with an inter-block cache, we must first unwrap
 			// it to get the underlying IAVL store.
 			store = rs.GetCommitKVStore(key)
-			// MemIAVL does not support version rollback at the individual store level.
-			if _, ok := store.(*memiavl.Store); ok {
-				continue
-			}
 			err := store.(*iavl.Store).LoadVersionForOverwriting(target)
 			if err != nil {
 				return err
@@ -1419,6 +1424,17 @@ func (rs *Store) loadVersionMemIAVL(ver int64, upgrades *types.StoreUpgrades) er
 		return fmt.Errorf("open memiavl DB: %w", err)
 	}
 	rs.memiavlDB = db
+
+	// Auto-rollback: if MemIAVL is ahead of CometBFT (partial commit before crash),
+	// roll back to the expected version so state matches the block store.
+	dbVersion := db.CommittedVersion()
+	if ver > 0 && dbVersion > ver {
+		rs.logger.Info("memiavl ahead of expected version, rolling back",
+			"dbVersion", dbVersion, "expectedVersion", ver)
+		if err := db.Rollback(ver); err != nil {
+			return fmt.Errorf("auto-rollback memiavl from %d to %d: %w", dbVersion, ver, err)
+		}
+	}
 
 	// If initial version needs to be set on the DB trees.
 	if rs.initialVersion > 0 {

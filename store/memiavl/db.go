@@ -461,6 +461,85 @@ func (db *DB) pruneSnapshots(currentVersion int64) {
 	}
 }
 
+// Rollback rolls back the DB state to the given target version.
+// It re-loads from the latest snapshot (if snapshotVersion <= target), replays
+// WAL entries up to targetVersion, and truncates all WAL entries after target.
+// This is used to recover from partial commits where MemIAVL advanced beyond
+// the version that CometBFT finalized.
+func (db *DB) Rollback(targetVersion int64) error {
+	db.mtx.Lock()
+	defer db.mtx.Unlock()
+
+	if db.closed {
+		return errors.New("db is closed")
+	}
+
+	currentVersion := db.MultiTree.Version()
+	if targetVersion >= currentVersion {
+		return nil // nothing to do
+	}
+
+	if targetVersion < db.snapshotVersion {
+		return fmt.Errorf("cannot rollback to version %d: below snapshot version %d", targetVersion, db.snapshotVersion)
+	}
+
+	// Cancel any in-progress snapshot rewrite — it may reference stale state.
+	if db.snapshotRewriteCancelFunc != nil {
+		db.snapshotRewriteCancelFunc()
+		db.snapshotRewriteChan = nil
+		db.snapshotRewriteCancelFunc = nil
+	}
+
+	// Re-load from the current snapshot, or create empty trees if no snapshot exists.
+	var newMT *MultiTree
+	currentPath := filepath.Join(db.dir, currentLink)
+	snapshotName, err := os.Readlink(currentPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("read current link for rollback: %w", err)
+		}
+		// No snapshot — rebuild from initial stores.
+		newMT = NewEmptyMultiTree(db.config.InitialStores)
+	} else {
+		snapshotDir := filepath.Join(db.dir, snapshotName)
+		mt, loadErr := LoadMultiTree(context.Background(), snapshotDir)
+		if loadErr != nil {
+			return fmt.Errorf("reload snapshot for rollback: %w", loadErr)
+		}
+		newMT = mt
+	}
+
+	// Replay WAL entries up to targetVersion only.
+	walEntries, err := db.wal.ReadAll()
+	if err != nil {
+		return fmt.Errorf("read WAL for rollback: %w", err)
+	}
+
+	for _, entry := range walEntries {
+		if entry.Version <= db.snapshotVersion {
+			continue // already in snapshot
+		}
+		if entry.Version > targetVersion {
+			break // stop replaying — entries are version-ordered
+		}
+		if err := newMT.ApplyChangeSets(entry.ChangeSets); err != nil {
+			return fmt.Errorf("rollback apply changeset %d: %w", entry.Version, err)
+		}
+		if _, err := newMT.SaveVersion(true); err != nil {
+			return fmt.Errorf("rollback save version %d: %w", entry.Version, err)
+		}
+	}
+
+	// Truncate WAL entries after target version.
+	if err := db.wal.TruncateAfter(targetVersion); err != nil {
+		return fmt.Errorf("truncate WAL after rollback: %w", err)
+	}
+
+	// Switch to the rolled-back tree.
+	db.MultiTree = newMT
+	return nil
+}
+
 // ForceSnapshot triggers an immediate snapshot write (synchronous).
 // Useful for testing and graceful shutdown.
 func (db *DB) ForceSnapshot() error {
