@@ -47,7 +47,7 @@ type DBConfig struct {
 // DefaultDBConfig returns a config with sensible defaults.
 func DefaultDBConfig() DBConfig {
 	return DBConfig{
-		SnapshotInterval:        10000,
+		SnapshotInterval:        500,
 		SnapshotKeepRecent:      1,
 		SnapshotMinTimeInterval: time.Hour,
 		WALBufferSize:           0, // sync writes — must reach disk before Commit returns
