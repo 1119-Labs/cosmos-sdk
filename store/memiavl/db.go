@@ -49,7 +49,7 @@ func DefaultDBConfig() DBConfig {
 	return DBConfig{
 		SnapshotInterval:        500,
 		SnapshotKeepRecent:      1,
-		SnapshotMinTimeInterval: time.Hour,
+		SnapshotMinTimeInterval: time.Minute,
 		WALBufferSize:           0, // sync writes — must reach disk before Commit returns
 		WALDir:                  "changelog",
 	}
