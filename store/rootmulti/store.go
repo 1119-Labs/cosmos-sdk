@@ -1436,6 +1436,16 @@ func (rs *Store) loadVersionMemIAVL(ver int64, upgrades *types.StoreUpgrades) er
 		}
 	}
 
+	// Safety check: if MemIAVL is behind the expected version, something is wrong
+	// (e.g., WAL entries were lost due to a bug in TruncateBefore). Log a warning.
+	// CometBFT will replay the missing blocks, but this indicates data loss.
+	dbVersion = db.CommittedVersion() // re-read after potential rollback
+	if ver > 0 && dbVersion < ver {
+		rs.logger.Error("CRITICAL: memiavl is behind expected version — WAL entries may have been lost",
+			"dbVersion", dbVersion, "expectedVersion", ver,
+			"missingVersions", ver-dbVersion)
+	}
+
 	// If initial version needs to be set on the DB trees.
 	if rs.initialVersion > 0 {
 		if err := db.MultiTree.SetInitialVersion(rs.initialVersion); err != nil {

@@ -2,6 +2,7 @@ package memiavl
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -281,18 +282,98 @@ func TestWALTruncate(t *testing.T) {
 	require.NoError(t, wal2.TruncateBefore(5))
 	require.NoError(t, wal2.Close())
 
-	// Read back — should still have some entries (truncation removes whole segments).
+	// Read back — should have only entries >= version 5.
 	wal3, err := OpenWAL(dir, 0)
 	require.NoError(t, err)
 	defer wal3.Close()
 
 	entries, err := wal3.ReadAll()
 	require.NoError(t, err)
-	// All entries are in one segment (< 10000 entries), so truncation may not remove the segment.
-	// But entries with version <= 5 should not cause errors either way.
+	// TruncateBefore(5) should keep only entries with version >= 5.
+	require.Len(t, entries, 6) // versions 5,6,7,8,9,10
 	for _, e := range entries {
-		require.GreaterOrEqual(t, e.Version, int64(1))
+		require.GreaterOrEqual(t, e.Version, int64(5))
 	}
+}
+
+// TestWALTruncateBeforePreservesPostSnapshotEntries verifies that TruncateBefore
+// does NOT lose entries >= target version even when they share a segment with
+// entries < target version. This was the root cause of a crash-loop bug where
+// WAL entries between snapshot version and the segment boundary were lost.
+func TestWALTruncateBeforePreservesPostSnapshotEntries(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := OpenWAL(dir, 0)
+	require.NoError(t, err)
+
+	// Write 50 entries (versions 1-50) — all in one segment since segmentMaxEntries=10000.
+	for v := int64(1); v <= 50; v++ {
+		require.NoError(t, wal.Write(WALEntry{
+			Version: v,
+			ChangeSets: []NamedChangeSet{
+				{Name: "bank", Pairs: []KVPair{{Key: []byte(fmt.Sprintf("k%d", v)), Value: []byte{byte(v)}}}},
+			},
+		}))
+	}
+	require.NoError(t, wal.Close())
+
+	// Simulate snapshot at version 30: TruncateBefore(30) should keep entries 30-50.
+	wal2, err := OpenWAL(dir, 0)
+	require.NoError(t, err)
+	require.NoError(t, wal2.TruncateBefore(30))
+	require.NoError(t, wal2.Close())
+
+	// Read back and verify entries 30-50 are preserved.
+	wal3, err := OpenWAL(dir, 0)
+	require.NoError(t, err)
+	defer wal3.Close()
+
+	entries, err := wal3.ReadAll()
+	require.NoError(t, err)
+
+	// Must have exactly 21 entries (versions 30-50).
+	require.Len(t, entries, 21, "expected entries for versions 30-50")
+	for i, e := range entries {
+		expectedVersion := int64(30 + i)
+		require.Equal(t, expectedVersion, e.Version, "entry %d has wrong version", i)
+		require.Len(t, e.ChangeSets, 1)
+		require.Equal(t, "bank", e.ChangeSets[0].Name)
+	}
+}
+
+// TestWALSegmentRotation verifies that segments are rotated at segmentMaxEntries.
+func TestWALSegmentRotation(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := OpenWAL(dir, 0)
+	require.NoError(t, err)
+
+	// Write segmentMaxEntries + 5 entries to trigger rotation.
+	total := segmentMaxEntries + 5
+	for v := int64(1); v <= int64(total); v++ {
+		require.NoError(t, wal.Write(WALEntry{
+			Version:    v,
+			ChangeSets: []NamedChangeSet{{Name: "s", Pairs: []KVPair{{Key: []byte("k"), Value: []byte{1}}}}},
+		}))
+	}
+	require.NoError(t, wal.Close())
+
+	// Should have 2 segments now.
+	wal2, err := OpenWAL(dir, 0)
+	require.NoError(t, err)
+	defer wal2.Close()
+
+	entries, err := wal2.ReadAll()
+	require.NoError(t, err)
+	require.Len(t, entries, total)
+
+	// Check segment files.
+	segs, err := wal2.listSegments()
+	require.NoError(t, err)
+	require.Len(t, segs, 2, "expected 2 segments after rotation")
+
+	// First segment starts at version 1.
+	require.Equal(t, int64(1), segmentVersion(segs[0]))
+	// Second segment starts at version segmentMaxEntries+1.
+	require.Equal(t, int64(segmentMaxEntries+1), segmentVersion(segs[1]))
 }
 
 // TestWALDeleteValues tests WAL with delete operations.

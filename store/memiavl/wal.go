@@ -30,8 +30,9 @@ type WAL struct {
 	bufferSize int
 
 	// Current write segment.
-	currentFile    *os.File
-	currentVersion int64 // first version in current segment
+	currentFile       *os.File
+	currentVersion    int64 // first version in current segment
+	currentEntryCount int   // entries written to current segment
 
 	// Async support.
 	writeCh  chan WALEntry
@@ -108,6 +109,18 @@ func (w *WAL) writeSync(entry WALEntry) error {
 		if err := w.openNewSegment(entry.Version); err != nil {
 			return err
 		}
+		w.currentEntryCount = 0
+	}
+
+	// Rotate segment when it reaches the max entry count.
+	if w.currentEntryCount >= segmentMaxEntries {
+		_ = w.currentFile.Sync()
+		_ = w.currentFile.Close()
+		w.currentFile = nil
+		if err := w.openNewSegment(entry.Version); err != nil {
+			return err
+		}
+		w.currentEntryCount = 0
 	}
 
 	data := marshalWALEntry(entry)
@@ -119,6 +132,7 @@ func (w *WAL) writeSync(entry WALEntry) error {
 	if _, err := w.currentFile.Write(data); err != nil {
 		return err
 	}
+	w.currentEntryCount++
 	// fsync to guarantee the entry is on disk before Commit returns.
 	// Without this, a crash can lose WAL data causing app hash mismatch on replay.
 	return w.currentFile.Sync()
@@ -171,7 +185,9 @@ func (w *WAL) ReadAll() ([]WALEntry, error) {
 	return entries, nil
 }
 
-// TruncateBefore removes all WAL segments whose first version is before the given version.
+// TruncateBefore removes WAL entries with version < the given version.
+// Segments whose entries are ALL before the target version are removed entirely.
+// Segments that span the boundary are rewritten to keep only entries >= version.
 func (w *WAL) TruncateBefore(version int64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -181,19 +197,80 @@ func (w *WAL) TruncateBefore(version int64) error {
 		return err
 	}
 
-	for _, seg := range segments {
+	for i, seg := range segments {
 		segVersion := segmentVersion(seg)
-		if segVersion < version {
-			// If this is the current segment, close the file handle first.
-			if segVersion == w.currentVersion && w.currentFile != nil {
-				_ = w.currentFile.Sync()
-				_ = w.currentFile.Close()
-				w.currentFile = nil
+		if segVersion >= version {
+			continue // this segment starts at or after the target — keep it entirely
+		}
+
+		segPath := filepath.Join(w.dir, seg)
+
+		// Check if the NEXT segment starts at or after the target version.
+		// If so, this segment's entries are all < version — safe to remove entirely.
+		// If there's no next segment, we must read this one to check for entries >= version.
+		canRemoveEntirely := false
+		if i+1 < len(segments) {
+			nextSegVersion := segmentVersion(segments[i+1])
+			if nextSegVersion <= version {
+				// Next segment also starts before version — this segment is entirely < version.
+				canRemoveEntirely = true
 			}
-			// This entire segment is before the version — safe to remove.
-			if err := os.Remove(filepath.Join(w.dir, seg)); err != nil && !os.IsNotExist(err) {
+		}
+
+		// If this is the current write segment, close it before any file operation.
+		if segVersion == w.currentVersion && w.currentFile != nil {
+			_ = w.currentFile.Sync()
+			_ = w.currentFile.Close()
+			w.currentFile = nil
+		}
+
+		if canRemoveEntirely {
+			if err := os.Remove(segPath); err != nil && !os.IsNotExist(err) {
 				return err
 			}
+			continue
+		}
+
+		// This segment may contain entries >= version. Read it and keep those.
+		entries, err := w.readSegment(seg)
+		if err != nil {
+			return fmt.Errorf("read segment %s for truncation: %w", seg, err)
+		}
+
+		var keep []WALEntry
+		for _, e := range entries {
+			if e.Version >= version {
+				keep = append(keep, e)
+			}
+		}
+
+		// Remove the original segment.
+		if err := os.Remove(segPath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+
+		// Rewrite with only the kept entries.
+		if len(keep) > 0 {
+			if err := w.openNewSegment(keep[0].Version); err != nil {
+				return err
+			}
+			w.currentEntryCount = 0
+			for _, e := range keep {
+				data := marshalWALEntry(e)
+				var lenBuf [4]byte
+				binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(data)))
+				if _, err := w.currentFile.Write(lenBuf[:]); err != nil {
+					return err
+				}
+				if _, err := w.currentFile.Write(data); err != nil {
+					return err
+				}
+				w.currentEntryCount++
+			}
+			if err := w.currentFile.Sync(); err != nil {
+				return err
+			}
+			// Don't close — this becomes the current write segment.
 		}
 	}
 	return nil
