@@ -335,45 +335,44 @@ func (db *DB) checkBackgroundSnapshotRewrite() error {
 			return result.err
 		}
 
-		// The new snapshot is at an older version; we need to replay WAL to catch up.
+		// The new snapshot was written and loaded from disk. We do NOT switch
+		// db.MultiTree to the new snapshot-loaded tree because the Store objects
+		// in rootmulti hold direct references to the current trees. Replacing
+		// db.MultiTree would cause Store.Set to write to the old trees while
+		// CommitWithoutApply operates on the new trees, producing wrong hashes.
+		//
+		// Instead, we only:
+		// 1. Update the "current" symlink so restart loads the latest snapshot
+		// 2. Truncate WAL entries before the snapshot version
+		// 3. Update snapshotVersion so the next snapshot triggers correctly
+		// The live tree continues to grow in memory; the snapshot is for restart.
 		newMT := result.newMT
-		walEntries, err := db.wal.ReadAll()
-		if err != nil {
-			return fmt.Errorf("read WAL for catchup: %w", err)
-		}
+		snapshotVersion := newMT.Version()
 
-		catchupVersion := newMT.Version()
-		for _, entry := range walEntries {
-			if entry.Version <= catchupVersion {
-				continue
-			}
-			if err := newMT.ApplyChangeSets(entry.ChangeSets); err != nil {
-				return fmt.Errorf("catchup apply changeset %d: %w", entry.Version, err)
-			}
-			if _, err := newMT.SaveVersion(false); err != nil {
-				return fmt.Errorf("catchup save version %d: %w", entry.Version, err)
+		// Close the snapshot-loaded trees — we don't need them for live execution.
+		for _, nt := range newMT.Trees() {
+			if nt.Tree != nil {
+				_ = nt.Tree.Close()
 			}
 		}
 
-		// Switch to the new tree.
-		db.snapshotVersion = catchupVersion
-		db.MultiTree = newMT
+		db.snapshotVersion = snapshotVersion
 		db.lastSnapshotTime = time.Now()
 
 		// Update the "current" symlink.
-		snapshotName := fmt.Sprintf("%s%020d", SnapshotPrefix, catchupVersion)
+		snapshotName := fmt.Sprintf("%s%020d", SnapshotPrefix, snapshotVersion)
 		if err := updateCurrentLink(db.dir, snapshotName); err != nil {
 			return fmt.Errorf("update current link: %w", err)
 		}
 
 		// Truncate WAL entries before the snapshot version.
-		if err := db.wal.TruncateBefore(catchupVersion); err != nil {
+		if err := db.wal.TruncateBefore(snapshotVersion); err != nil {
 			return fmt.Errorf("truncate WAL: %w", err)
 		}
 
 		// Prune old snapshots in background.
 		if db.config.SnapshotKeepRecent > 0 {
-			go db.pruneSnapshots(catchupVersion)
+			go db.pruneSnapshots(snapshotVersion)
 		}
 
 	default:
