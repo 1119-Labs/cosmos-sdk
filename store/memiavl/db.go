@@ -173,21 +173,24 @@ func (db *DB) Commit(changeSets []NamedChangeSet) (int64, error) {
 		return 0, fmt.Errorf("apply changesets: %w", err)
 	}
 
-	// SaveVersion — increment version and compute hashes.
-	version, err := db.MultiTree.SaveVersion(true)
-	if err != nil {
-		return 0, fmt.Errorf("save version: %w", err)
-	}
-
-	// Write to WAL AFTER SaveVersion succeeds.
-	// On crash between SaveVersion and WAL write: the version is lost,
-	// but state is consistent (no partial writes).
+	// Write-ahead: persist changeset to WAL BEFORE committing in-memory state.
+	// This ensures crash recovery can replay the WAL to reconstruct any version
+	// that was committed in memory but lost on crash. The version is predictable:
+	// lastVersion + 1, same as what SaveVersion will produce.
+	nextVersion := db.MultiTree.Version() + 1
 	walEntry := WALEntry{
-		Version:    version,
+		Version:    nextVersion,
 		ChangeSets: changeSets,
 	}
 	if err := db.wal.Write(walEntry); err != nil {
 		return 0, fmt.Errorf("write WAL: %w", err)
+	}
+
+	// SaveVersion — increment version and compute hashes.
+	// WAL is already durable, so a crash after this point is recoverable.
+	version, err := db.MultiTree.SaveVersion(true)
+	if err != nil {
+		return 0, fmt.Errorf("save version: %w", err)
 	}
 
 	// Check for async snapshot rewrite completion.
@@ -214,19 +217,21 @@ func (db *DB) CommitWithoutApply(changeSets []NamedChangeSet) (int64, error) {
 		return 0, errors.New("db is closed")
 	}
 
-	// SaveVersion — increment version and compute hashes.
-	version, err := db.MultiTree.SaveVersion(true)
-	if err != nil {
-		return 0, fmt.Errorf("save version: %w", err)
-	}
-
-	// Write to WAL AFTER SaveVersion succeeds.
+	// Write-ahead: persist changeset to WAL BEFORE committing in-memory state.
+	nextVersion := db.MultiTree.Version() + 1
 	walEntry := WALEntry{
-		Version:    version,
+		Version:    nextVersion,
 		ChangeSets: changeSets,
 	}
 	if err := db.wal.Write(walEntry); err != nil {
 		return 0, fmt.Errorf("write WAL: %w", err)
+	}
+
+	// SaveVersion — increment version and compute hashes.
+	// WAL is already durable, so a crash after this point is recoverable.
+	version, err := db.MultiTree.SaveVersion(true)
+	if err != nil {
+		return 0, fmt.Errorf("save version: %w", err)
 	}
 
 	// Check for async snapshot rewrite completion.
